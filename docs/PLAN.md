@@ -3,7 +3,8 @@ PLAN: "feat: webtyp/weights — formato de artifact de modelo y caché en el nav
 TAG: v0.1.0
 EXECUTOR: unassigned
 REVIEWER: none
-REPO: webtyp/weights
+STATUS: running
+SESSION: 16705645471745655629
 ---
 
 > Repositorio nuevo, ya creado.
