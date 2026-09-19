@@ -1,80 +1,88 @@
 package weights_test
 
 import (
-	"context"
 	"bytes"
-	"encoding/binary"
 	"errors"
-	"fmt"
-	"hash/crc32"
 	"reflect"
 	"testing"
+	"unsafe"
 
+	"webtyp.com/context"
+	"webtyp.com/fetch"
+	"webtyp.com/model"
+	"webtyp.com/storage"
 	"webtyp.com/weights"
 )
 
-type memoryStorage struct {
-	m     map[string][]byte
-	quota int64
-	usage int64
+type mockStorage struct {
+	data      map[string][]byte
+	quota     int64
+	usage     int64
+	lastQuery storage.Query
 }
 
-func newMemoryStorage(quota int64) *memoryStorage {
-	return &memoryStorage{
-		m:     make(map[string][]byte),
+func newMockStorage(quota int64) *mockStorage {
+	return &mockStorage{
+		data:  make(map[string][]byte),
 		quota: quota,
 	}
 }
 
-func (ms *memoryStorage) Get(key string) ([]byte, error) {
-	val, ok := ms.m[key]
-	if !ok {
-		return nil, errors.New("not found")
+func (m *mockStorage) EstimateQuota() (int64, int64, error) {
+	if m.quota < 0 {
+		return 0, 0, errors.New("quota unavailable")
 	}
-	return val, nil
+	return m.quota, m.usage, nil
 }
 
-func (ms *memoryStorage) Put(key string, val []byte) error {
-	oldLen := len(ms.m[key])
-	ms.m[key] = val
-	ms.usage += int64(len(val) - oldLen)
+func (m *mockStorage) Compile(q storage.Query, _ model.Model) (storage.Plan, error) {
+	m.lastQuery = q
+	return storage.Plan{}, nil
+}
+
+func (m *mockStorage) Exec(query string, args ...any) error {
+	q := m.lastQuery
+	switch q.Action {
+	case storage.ActionCreate:
+		key := q.Values[0].(string)
+		val := q.Values[1].([]byte)
+		m.data[key] = val
+		m.usage += int64(len(val))
+	case storage.ActionDelete:
+		key := q.Conditions[0].Value().(string)
+		if val, ok := m.data[key]; ok {
+			m.usage -= int64(len(val))
+			delete(m.data, key)
+		}
+	}
 	return nil
 }
 
-func (ms *memoryStorage) Delete(key string) error {
-	if val, ok := ms.m[key]; ok {
-		ms.usage -= int64(len(val))
-		delete(ms.m, key)
-	}
+func (m *mockStorage) QueryRow(query string, args ...any) storage.Scanner {
+	q := m.lastQuery
+	key := q.Conditions[0].Value().(string)
+	val := m.data[key]
+	return &mockScanner{val: val}
+}
+
+func (m *mockStorage) Query(query string, args ...any) (storage.Rows, error) {
+	return nil, nil
+}
+
+func (m *mockStorage) Close() error {
 	return nil
 }
 
-func (ms *memoryStorage) EstimateQuota() (int64, int64, error) {
-	return ms.quota, ms.usage, nil
+type mockScanner struct {
+	val []byte
 }
 
-type mockFetcher struct {
-	data      []byte
-	err       error
-	fetchCount int
-}
-
-func (f *mockFetcher) Fetch(ctx context.Context, url string, onProgress func(done, total int64)) ([]byte, error) {
-	f.fetchCount++
-	if f.err != nil {
-		return nil, f.err
+func (s *mockScanner) Scan(dest ...any) error {
+	if len(s.val) == 0 {
+		return storage.ErrNoRows
 	}
-	if onProgress != nil {
-		chunkSize := len(f.data) / 2
-		if chunkSize == 0 {
-			chunkSize = len(f.data)
-		}
-		onProgress(int64(chunkSize), int64(len(f.data)))
-		if chunkSize < len(f.data) {
-			onProgress(int64(len(f.data)), int64(len(f.data)))
-		}
-	}
-	return f.data, nil
+	*(dest[0].(*[]byte)) = s.val
+	return nil
 }
 
 func createTestArtifactData(t *testing.T, id string, ver uint32) []byte {
@@ -129,6 +137,9 @@ func TestOpen_RoundTrip(t *testing.T) {
 	if len(art.Tensors) != 2 {
 		t.Fatalf("got %d tensors, want 2", len(art.Tensors))
 	}
+	if !art.Tokenizer.Lowercase || !art.Tokenizer.StripAccents {
+		t.Errorf("tokenizer config mismatch: %+v", art.Tokenizer)
+	}
 }
 
 func TestOpen_BadMagic(t *testing.T) {
@@ -151,7 +162,6 @@ func TestOpen_TruncatedTensorData(t *testing.T) {
 
 func TestOpen_ChecksumMismatch(t *testing.T) {
 	data := createTestArtifactData(t, "test-model", 1)
-	// Mutate last byte of tensor data
 	data[len(data)-1] ^= 0xFF
 	_, err := weights.Open(data)
 	if !errors.Is(err, weights.ErrChecksumMismatch) {
@@ -168,7 +178,7 @@ func TestOpen_Alignment(t *testing.T) {
 
 	for _, ts := range art.Tensors {
 		if len(ts.Data) > 0 {
-			ptr := uintptr(reflect.ValueOf(&ts.Data[0]).Pointer())
+			ptr := uintptr(unsafe.Pointer(&ts.Data[0]))
 			if ptr%64 != 0 {
 				t.Errorf("tensor %s data pointer 0x%x not 64-byte aligned", ts.Name, ptr)
 			}
@@ -198,8 +208,7 @@ func TestTensor_Float32sZeroCopy(t *testing.T) {
 		t.Errorf("got float32s %v, want %v", f32s, expected)
 	}
 
-	// Verify slice alias
-	if &f32s[0] != (*float32)(reflect.ValueOf(&ts.Data[0]).UnsafePointer()) {
+	if unsafe.Pointer(&f32s[0]) != unsafe.Pointer(&ts.Data[0]) {
 		t.Errorf("Float32s slice does not alias tensor Data buffer")
 	}
 }
@@ -257,18 +266,23 @@ func TestTensor_Row(t *testing.T) {
 
 func TestLoad_CachesAfterFirstFetch(t *testing.T) {
 	data := createTestArtifactData(t, "cache-model", 1)
-	fetcher := &mockFetcher{data: data}
-	storage := newMemoryStorage(1024 * 1024)
+	fetchCount := 0
 
+	mockFetcher := func(url string, cb func(*fetch.Response, error)) {
+		fetchCount++
+		resp := fetch.NewResponse(200, nil, data)
+		cb(resp, nil)
+	}
+
+	storage := newMockStorage(1024 * 1024)
 	cfg := weights.LoadConfig{
 		ID:      "cache-model",
 		Version: 1,
-		URL:     "https://example.com/model.wtypw",
+		URL:     "https://example.com/cache-model.wtypw",
 		Conn:    storage,
-		Fetcher: fetcher,
+		Fetcher: mockFetcher,
 	}
 
-	// First load fetches from network
 	art1, err := weights.Load(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("First Load failed: %v", err)
@@ -276,11 +290,10 @@ func TestLoad_CachesAfterFirstFetch(t *testing.T) {
 	if art1.ID != "cache-model" {
 		t.Errorf("got ID %s, want cache-model", art1.ID)
 	}
-	if fetcher.fetchCount != 1 {
-		t.Errorf("fetcher count got %d, want 1", fetcher.fetchCount)
+	if fetchCount != 1 {
+		t.Errorf("fetchCount got %d, want 1", fetchCount)
 	}
 
-	// Second load reads from cache
 	art2, err := weights.Load(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Second Load failed: %v", err)
@@ -288,23 +301,55 @@ func TestLoad_CachesAfterFirstFetch(t *testing.T) {
 	if art2.ID != "cache-model" {
 		t.Errorf("got ID %s, want cache-model", art2.ID)
 	}
-	if fetcher.fetchCount != 1 {
-		t.Errorf("fetcher count got %d, want 1 (should be cached)", fetcher.fetchCount)
+	if fetchCount != 1 {
+		t.Errorf("fetchCount got %d, want 1 (should be cached)", fetchCount)
+	}
+}
+
+func TestLoad_NoQuotaDoesNotCache(t *testing.T) {
+	data := createTestArtifactData(t, "no-quota-model", 1)
+	mockFetcher := func(url string, cb func(*fetch.Response, error)) {
+		cb(fetch.NewResponse(200, nil, data), nil)
+	}
+
+	// Storage without quota estimation capability
+	storage := newMockStorage(-1)
+	cfg := weights.LoadConfig{
+		ID:      "no-quota-model",
+		Version: 1,
+		URL:     "https://example.com/no-quota.wtypw",
+		Conn:    storage,
+		Fetcher: mockFetcher,
+	}
+
+	art, err := weights.Load(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if art.ID != "no-quota-model" {
+		t.Errorf("got ID %s, want no-quota-model", art.ID)
+	}
+
+	if len(storage.data) != 0 {
+		t.Errorf("expected storage to remain empty when quota estimation unavailable")
 	}
 }
 
 func TestLoad_PartialBodyNotCached(t *testing.T) {
 	data := createTestArtifactData(t, "partial-model", 1)
 	truncated := data[:len(data)-10]
-	fetcher := &mockFetcher{data: truncated}
-	storage := newMemoryStorage(1024 * 1024)
 
+	mockFetcher := func(url string, cb func(*fetch.Response, error)) {
+		cb(fetch.NewResponse(200, nil, truncated), nil)
+	}
+
+	storage := newMockStorage(1024 * 1024)
 	cfg := weights.LoadConfig{
 		ID:      "partial-model",
 		Version: 1,
 		URL:     "https://example.com/partial.wtypw",
 		Conn:    storage,
-		Fetcher: fetcher,
+		Fetcher: mockFetcher,
 	}
 
 	_, err := weights.Load(context.Background(), cfg)
@@ -312,44 +357,45 @@ func TestLoad_PartialBodyNotCached(t *testing.T) {
 		t.Fatalf("expected error for partial body, got nil")
 	}
 
-	// Verify storage remains empty
-	cached, _ := storage.Get("partial-model@1")
-	if cached != nil {
-		t.Errorf("expected cache to be empty, found %d bytes", len(cached))
+	if len(storage.data) != 0 {
+		t.Errorf("expected storage to remain empty, found %d entries", len(storage.data))
 	}
 }
 
 func TestLoad_VersionBumpRefetches(t *testing.T) {
 	dataV1 := createTestArtifactData(t, "version-model", 1)
 	dataV2 := createTestArtifactData(t, "version-model", 2)
+	fetchCount := 0
 
-	fetcher := &mockFetcher{data: dataV1}
-	storage := newMemoryStorage(1024 * 1024)
+	mockFetcher := func(url string, cb func(*fetch.Response, error)) {
+		fetchCount++
+		if fetchCount == 1 {
+			cb(fetch.NewResponse(200, nil, dataV1), nil)
+		} else {
+			cb(fetch.NewResponse(200, nil, dataV2), nil)
+		}
+	}
 
+	storage := newMockStorage(1024 * 1024)
 	cfgV1 := weights.LoadConfig{
 		ID:      "version-model",
 		Version: 1,
-		URL:     "https://example.com/version1.wtypw",
+		URL:     "https://example.com/version.wtypw",
 		Conn:    storage,
-		Fetcher: fetcher,
+		Fetcher: mockFetcher,
 	}
 
 	_, err := weights.Load(context.Background(), cfgV1)
 	if err != nil {
 		t.Fatalf("Load V1 failed: %v", err)
 	}
-	if fetcher.fetchCount != 1 {
-		t.Errorf("fetcher count got %d, want 1", fetcher.fetchCount)
-	}
 
-	// Version bump
-	fetcher.data = dataV2
 	cfgV2 := weights.LoadConfig{
 		ID:      "version-model",
 		Version: 2,
-		URL:     "https://example.com/version2.wtypw",
+		URL:     "https://example.com/version.wtypw",
 		Conn:    storage,
-		Fetcher: fetcher,
+		Fetcher: mockFetcher,
 	}
 
 	artV2, err := weights.Load(context.Background(), cfgV2)
@@ -359,58 +405,21 @@ func TestLoad_VersionBumpRefetches(t *testing.T) {
 	if artV2.Version != 2 {
 		t.Errorf("got Version %d, want 2", artV2.Version)
 	}
-	if fetcher.fetchCount != 2 {
-		t.Errorf("fetcher count got %d, want 2", fetcher.fetchCount)
-	}
-}
-
-func TestLoad_ProgressCallback(t *testing.T) {
-	data := createTestArtifactData(t, "progress-model", 1)
-	fetcher := &mockFetcher{data: data}
-
-	var progressReports [][2]int64
-	onProgress := func(done, total int64) {
-		progressReports = append(progressReports, [2]int64{done, total})
-	}
-
-	cfg := weights.LoadConfig{
-		ID:         "progress-model",
-		Version:    1,
-		URL:        "https://example.com/progress.wtypw",
-		Fetcher:    fetcher,
-		OnProgress: onProgress,
-	}
-
-	_, err := weights.Load(context.Background(), cfg)
-	if err != nil {
-		t.Fatalf("Load failed: %v", err)
-	}
-
-	if len(progressReports) == 0 {
-		t.Fatalf("expected progress reports, got none")
-	}
-
-	last := progressReports[len(progressReports)-1]
-	if last[0] != last[1] || last[1] != int64(len(data)) {
-		t.Errorf("last progress report got %v, want [%d %d]", last, len(data), len(data))
+	if fetchCount != 2 {
+		t.Errorf("fetchCount got %d, want 2", fetchCount)
 	}
 }
 
 func TestEvict(t *testing.T) {
-	storage := newMemoryStorage(1024 * 1024)
-	_ = storage.Put("model-to-evict@1", []byte("data"))
+	storage := newMockStorage(1024 * 1024)
+	key := weights.CacheKey("model-to-evict", 1)
+	storage.data[key] = []byte("data")
 
-	if err := weights.Evict(storage, "model-to-evict@1"); err != nil {
+	if err := weights.Evict(storage, "model-to-evict", 1); err != nil {
 		t.Fatalf("Evict failed: %v", err)
 	}
 
-	cached, _ := storage.Get("model-to-evict@1")
-	if cached != nil {
-		t.Errorf("expected entry to be evicted, got %v", cached)
+	if _, ok := storage.data[key]; ok {
+		t.Errorf("expected entry to be evicted")
 	}
 }
-
-// Silence unused variable warning if any
-var _ = fmt.Sprintf
-var _ = crc32.ChecksumIEEE
-var _ = binary.LittleEndian

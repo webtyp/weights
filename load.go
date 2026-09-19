@@ -1,138 +1,133 @@
 package weights
 
 import (
-	"context"
-	"io"
-	"net/http"
-	"strconv"
+	"webtyp.com/context"
+	"webtyp.com/fetch"
+	"webtyp.com/fmt"
+	"webtyp.com/storage"
 )
 
-// StorageConn abstracts storage operations (IndexedDB in browser or key-value store).
-type StorageConn interface {
-	Get(key string) ([]byte, error)
-	Put(key string, val []byte) error
-	Delete(key string) error
+// QuotaEstimator is an optional interface that storage backends (e.g. IndexedDB)
+// may implement to provide storage quota estimation.
+type QuotaEstimator interface {
 	EstimateQuota() (quota int64, usage int64, err error)
 }
 
-// Fetcher abstracts HTTP fetching to facilitate testing or WASM wrappers.
-type Fetcher interface {
-	Fetch(ctx context.Context, url string, onProgress func(done, total int64)) ([]byte, error)
-}
-
-type defaultFetcher struct{}
-
-func (f defaultFetcher) Fetch(ctx context.Context, url string, onProgress func(done, total int64)) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, Error("weights: http status " + strconv.Itoa(resp.StatusCode))
-	}
-
-	total := resp.ContentLength
-	var done int64
-	var buf []byte
-	if total > 0 {
-		buf = make([]byte, 0, total)
-	}
-
-	tmp := make([]byte, 32*1024)
-	for {
-		n, rErr := resp.Body.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-			done += int64(n)
-			if onProgress != nil {
-				onProgress(done, total)
-			}
-		}
-		if rErr != nil {
-			if rErr == io.EOF {
-				break
-			}
-			return nil, rErr
-		}
-	}
-
-	return buf, nil
-}
-
-// LoadConfig configures artifact loading and browser caching.
+// LoadConfig configures artifact loading and storage caching.
 type LoadConfig struct {
 	ID         string
 	Version    uint32
 	URL        string
-	Conn       StorageConn
-	Fetcher    Fetcher
+	Conn       storage.Conn
 	OnProgress func(done, total int64)
+	Fetcher    func(url string, cb func(*fetch.Response, error))
 }
 
-func cacheKey(id string, version uint32) string {
-	return id + "@" + strconv.FormatUint(uint64(version), 10)
+// CacheKey returns the storage key for an artifact ID and version.
+func CacheKey(id string, version uint32) string {
+	vStr := fmt.Convert(version).String()
+	return fmt.Convert(id).WriteString("@").WriteString(vStr).String()
 }
 
-// Load fetches an artifact from URL or storage cache, validates it, and opens it.
-func Load(ctx context.Context, cfg LoadConfig) (*Artifact, error) {
-	key := cacheKey(cfg.ID, cfg.Version)
+// Load fetches an artifact from URL or storage cache, verifies it, and opens it.
+func Load(ctx *context.Context, cfg LoadConfig) (*Artifact, error) {
+	key := CacheKey(cfg.ID, cfg.Version)
 
-	// Check storage cache
+	// 1. Try reading from cache
 	if cfg.Conn != nil {
-		if cached, err := cfg.Conn.Get(key); err == nil && len(cached) > 0 {
-			art, err := Open(cached)
-			if err == nil {
-				if cfg.OnProgress != nil {
-					cfg.OnProgress(int64(len(cached)), int64(len(cached)))
+		var cachedData []byte
+		qRead := storage.Query{
+			Action:     storage.ActionReadOne,
+			Table:      "weights_cache",
+			Columns:    []string{"data"},
+			Conditions: []storage.Condition{storage.Eq("key", key)},
+		}
+		if _, err := cfg.Conn.Compile(qRead, nil); err == nil {
+			scanner := cfg.Conn.QueryRow("cache_read")
+			if err := scanner.Scan(&cachedData); err == nil && len(cachedData) > 0 {
+				art, err := Open(cachedData)
+				if err == nil {
+					if cfg.OnProgress != nil {
+						l := int64(len(cachedData))
+						cfg.OnProgress(l, l)
+					}
+					return art, nil
 				}
-				return art, nil
 			}
 		}
 	}
 
-	fetcher := cfg.Fetcher
-	if fetcher == nil {
-		fetcher = defaultFetcher{}
-	}
+	// 2. Fetch from network via webtyp.com/fetch
+	var body []byte
+	var fetchErr error
+	doneChan := make(chan struct{})
 
-	data, err := fetcher.Fetch(ctx, cfg.URL, cfg.OnProgress)
-	if err != nil {
-		return nil, err
-	}
-
-	// Verify before caching or returning
-	art, err := Open(data)
-	if err != nil {
-		return nil, err
-	}
-
-	// Store in cache after verification if quota allows
-	if cfg.Conn != nil {
-		quota, usage, err := cfg.Conn.EstimateQuota()
-		if err == nil && quota > 0 {
-			if usage+int64(len(data)) < quota {
-				_ = cfg.Conn.Put(key, data)
-			}
+	handleResp := func(resp *fetch.Response, err error) {
+		if err != nil {
+			fetchErr = err
+		} else if resp == nil || resp.Status != 200 {
+			fetchErr = ErrInvalidHeader
 		} else {
-			// If quota estimation is not supported or returns 0, try put anyway
-			_ = cfg.Conn.Put(key, data)
+			body = resp.Body()
+			if cfg.OnProgress != nil {
+				l := int64(len(body))
+				cfg.OnProgress(l, l)
+			}
+		}
+		close(doneChan)
+	}
+
+	if cfg.Fetcher != nil {
+		cfg.Fetcher(cfg.URL, handleResp)
+	} else {
+		fetch.Get(cfg.URL).Send(handleResp)
+	}
+
+	<-doneChan
+	if fetchErr != nil {
+		return nil, fetchErr
+	}
+
+	// 3. Verify artifact BEFORE writing to cache
+	art, err := Open(body)
+	if err != nil {
+		return nil, err
+	}
+
+	// 4. Cache ONLY if quota estimation succeeds and allows write
+	if cfg.Conn != nil {
+		if qe, ok := cfg.Conn.(QuotaEstimator); ok {
+			quota, usage, qErr := qe.EstimateQuota()
+			if qErr == nil && quota > 0 && usage+int64(len(body)) < quota {
+				qWrite := storage.Query{
+					Action:  storage.ActionCreate,
+					Table:   "weights_cache",
+					Columns: []string{"key", "data"},
+					Values:  []any{key, body},
+				}
+				if _, err := cfg.Conn.Compile(qWrite, nil); err == nil {
+					_ = cfg.Conn.Exec("cache_write")
+				}
+			}
 		}
 	}
 
 	return art, nil
 }
 
-// Evict removes an artifact entry from storage cache by key or ID pattern.
-func Evict(conn StorageConn, key string) error {
+// Evict removes an artifact entry from storage cache by ID and version.
+func Evict(conn storage.Conn, id string, version uint32) error {
 	if conn == nil {
 		return nil
 	}
-	return conn.Delete(key)
+	key := CacheKey(id, version)
+	qDel := storage.Query{
+		Action:     storage.ActionDelete,
+		Table:      "weights_cache",
+		Conditions: []storage.Condition{storage.Eq("key", key)},
+	}
+	if _, err := conn.Compile(qDel, nil); err != nil {
+		return err
+	}
+	return conn.Exec("cache_delete")
 }
