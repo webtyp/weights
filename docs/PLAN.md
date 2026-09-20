@@ -3,8 +3,9 @@ PLAN: "feat: webtyp/weights — formato de artifact de modelo y caché en el nav
 TAG: v0.1.0
 EXECUTOR: unassigned
 REVIEWER: none
-STATUS: running
+STATUS: review
 SESSION: 16705645471745655629
+PR: https://github.com/webtyp/weights/pull/1
 ---
 
 > Repositorio nuevo, ya creado.
