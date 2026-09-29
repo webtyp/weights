@@ -17,6 +17,9 @@ const (
 	ErrTruncatedTensorData = Error("weights: truncated tensor data")
 	ErrInvalidDType        = Error("weights: invalid dtype")
 	ErrInvalidHeader       = Error("weights: invalid header")
+	ErrScalesMismatch      = Error("weights: scale count does not match the tensor shape")
+	ErrRowOutOfRange       = Error("weights: row out of range")
+	ErrDstTooShort         = Error("weights: destination shorter than a row")
 )
 
 // DType represents tensor data types.
@@ -28,7 +31,15 @@ const (
 	Uint8   DType = "uint8"
 	Int4    DType = "int4"
 	Float16 DType = "float16"
+
+	// Int8Block32 is a 2-D tensor of int8 values, row-major, with one float32 scale per block of
+	// BlockSize consecutive values of a row (the layout of GGUF Q8_0): value = q × scale.
+	// Scales holds rows × ceil(cols / BlockSize) entries, row by row.
+	Int8Block32 DType = "int8b32"
 )
+
+// BlockSize is the number of consecutive values of a row that share one scale in Int8Block32.
+const BlockSize = 32
 
 func dtypeToByte(d DType) byte {
 	switch d {
@@ -42,6 +53,8 @@ func dtypeToByte(d DType) byte {
 		return 3
 	case Float16:
 		return 4
+	case Int8Block32:
+		return 5
 	default:
 		return 255
 	}
@@ -59,6 +72,8 @@ func byteToDType(b byte) (DType, error) {
 		return Int4, nil
 	case 4:
 		return Float16, nil
+	case 5:
+		return Int8Block32, nil
 	default:
 		return "", ErrInvalidDType
 	}
@@ -118,6 +133,63 @@ func (t Tensor) Row(i int) []byte {
 		return nil
 	}
 	return t.Data[start:end]
+}
+
+// Cols is the number of values in one row: the product of every dimension after the first.
+func (t Tensor) Cols() int {
+	if len(t.Shape) == 0 {
+		return 0
+	}
+	c := 1
+	for _, d := range t.Shape[1:] {
+		c *= d
+	}
+	return c
+}
+
+// blocksPerRow is ceil(cols / BlockSize).
+func blocksPerRow(cols int) int { return (cols + BlockSize - 1) / BlockSize }
+
+// DequantRow writes row i of the tensor into dst as float32, whatever its storage: Float32 is
+// copied, Int8 uses the row's scale, Int8Block32 uses one scale per BlockSize values.
+func (t Tensor) DequantRow(dst []float32, i int) error {
+	if len(t.Shape) == 0 || i < 0 || i >= t.Shape[0] {
+		return ErrRowOutOfRange
+	}
+	cols := t.Cols()
+	if len(dst) < cols {
+		return ErrDstTooShort
+	}
+	switch t.DType {
+	case Float32:
+		f, err := t.Float32s()
+		if err != nil {
+			return err
+		}
+		copy(dst[:cols], f[i*cols:(i+1)*cols])
+	case Int8:
+		if len(t.Scales) != t.Shape[0] {
+			return ErrScalesMismatch
+		}
+		s := t.Scales[i]
+		row := t.Data[i*cols : (i+1)*cols]
+		for c, b := range row {
+			dst[c] = float32(int8(b)) * s
+		}
+	case Int8Block32:
+		nb := blocksPerRow(cols)
+		if len(t.Scales) != t.Shape[0]*nb {
+			return ErrScalesMismatch
+		}
+		scales := t.Scales[i*nb : (i+1)*nb]
+		row := t.Data[i*cols : (i+1)*cols]
+		for c, b := range row {
+			dst[c] = float32(int8(b)) * scales[c/BlockSize]
+		}
+	default:
+		return ErrInvalidDType
+	}
+	return nil
 }
 
 // Artifact represents a loaded model artifact containing tensors and configuration.

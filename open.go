@@ -198,6 +198,13 @@ func Open(src []byte) (*Artifact, error) {
 			return nil, ErrTruncatedTensorData
 		}
 
+		if dt == Int8Block32 && len(shape) >= 2 {
+			t := Tensor{Shape: shape}
+			if int(scalesCount) != shape[0]*blocksPerRow(t.Cols()) {
+				return nil, ErrScalesMismatch
+			}
+		}
+
 		tensors[i] = Tensor{
 			Name:   tName,
 			DType:  dt,
