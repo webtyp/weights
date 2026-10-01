@@ -7,9 +7,13 @@ For end-user docs see [README.md](README.md); the current work order is [docs/PL
 
 ## What this library is
 
-`weights` carries model parameters from a URL to typed Go slices, **once per browser**. It owns the
-artifact file format, its reader, the fetch and the IndexedDB cache. It knows nothing about what the
-numbers mean — no tokenization, no inference, no embeddings.
+`weights` turns the bytes of a model artifact into typed Go slices. It owns the artifact file format,
+its writer and its reader (`Open`). It knows nothing about what the numbers mean — no tokenization,
+no inference, no embeddings — and nothing about where the bytes come from: downloading, verifying
+against the manifest and storing in OPFS is `webtyp/artifacts` (decision D-PWA-7 of
+[PWA_ARTIFACTS_MASTER_PLAN.md](https://github.com/webtyp/app/blob/main/docs/PWA_ARTIFACTS_MASTER_PLAN.md)).
+Do not add a fetch, a cache or a storage dependency here: `Load` and its IndexedDB cache were deleted
+for that reason.
 
 Its **primary runtime is a browser tab compiled with TinyGo**. The host (`go test`) is a convenience
 for development, not the target. Any change that is green on the host and red under TinyGo is **not
@@ -55,13 +59,9 @@ is the canonical example — it compiles for `js/wasm` and **fails to compile un
 
 This is the rule that was broken in PR #1 and the most expensive mistake available in this repo.
 
-- **Caching goes through `storage.Conn`**, injected by the caller. Do not declare a local
-  `StorageConn`/`Cache`/`KV` interface. `webtyp/indexdb` already implements `storage.Conn` over
-  IndexedDB and already handles `[]byte` payloads (`FieldBlob`). A second, parallel port means the
-  application cannot hand `weights` the connection it already has, and a second IndexedDB connection
-  to the same database is a source of version-change deadlocks.
-- **Fetching goes through `webtyp.com/fetch`.** Do not declare a local `Fetcher` interface to "make
-  it testable": `fetch` is already the seam, and it already works in both worlds.
+- **Storing and fetching are not this library's job.** `webtyp/artifacts` downloads, verifies and
+  stores in OPFS through `webtyp/files`; the caller hands `Open` the bytes. Do not declare a local
+  `StorageConn`/`Cache`/`Fetcher` interface, and do not bring `storage` or `fetch` back.
 - Before adding *any* interface, search the ecosystem for it. `storage`, `fetch`, `json`, `binary`,
   `crypto`, `context`, `fmt`, `time`, `model` cover most of what a library here needs.
 
@@ -98,10 +98,6 @@ need it.
   is meant to protect.
 - **64-byte alignment per tensor**, little-endian everywhere — the same endianness decision as
   `webtyp/vector`'s codec. One endianness decision in the whole system.
-- **Never cache before verifying.** Read the full body, check length and checksum, *then* write.
-- **Never write past the quota.** Consult the browser's storage estimate first; when the estimate is
-  unavailable, do **not** fall back to writing anyway — an eviction triggered here destroys the
-  user's document corpus, which is far more valuable than a re-downloadable artifact.
 
 ---
 
@@ -121,7 +117,7 @@ Publish with `gopush 'message'` — never `git commit`/`git push` directly.
 
 ## Common mistakes to avoid
 
-- Declaring a local interface for something `storage`/`fetch` already abstracts.
+- Adding a download or cache path here — that is `webtyp/artifacts`.
 - Believing `GOOS=js GOARCH=wasm go build ./...` proves TinyGo compatibility. It does not.
 - Putting a `cmd/` with `os`/`flag`/`log` in this module.
 - Making a correctness check conditional on a field being non-zero.
