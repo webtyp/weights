@@ -204,6 +204,18 @@ func Open(src []byte) (*Artifact, error) {
 				return nil, ErrScalesMismatch
 			}
 		}
+		if dt == Int4Block32 && len(shape) >= 2 {
+			cols := Tensor{Shape: shape}.Cols()
+			if cols%BlockSize != 0 {
+				return nil, ErrInt4Cols
+			}
+			if int(scalesCount) != shape[0]*cols/BlockSize {
+				return nil, ErrScalesMismatch
+			}
+			if int(dataLen) != shape[0]*cols/2 {
+				return nil, ErrTruncatedTensorData
+			}
+		}
 
 		tensors[i] = Tensor{
 			Name:   tName,

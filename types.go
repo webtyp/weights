@@ -20,6 +20,7 @@ const (
 	ErrScalesMismatch      = Error("weights: scale count does not match the tensor shape")
 	ErrRowOutOfRange       = Error("weights: row out of range")
 	ErrDstTooShort         = Error("weights: destination shorter than a row")
+	ErrInt4Cols            = Error("weights: Int4Block32 needs a number of columns that is a multiple of 32")
 )
 
 // DType represents tensor data types.
@@ -36,10 +37,19 @@ const (
 	// BlockSize consecutive values of a row (the layout of GGUF Q8_0): value = q × scale.
 	// Scales holds rows × ceil(cols / BlockSize) entries, row by row.
 	Int8Block32 DType = "int8b32"
+
+	// Int4Block32 is a 2-D tensor of 4-bit values in blocks of BlockSize (the layout of GGUF Q4_0,
+	// with float32 scales): each block of a row is Int4BlockBytes bytes, byte j holding value j in
+	// its low nibble and value j+16 in its high nibble; value = (nibble − 8) × scale. Its number of
+	// columns is a multiple of BlockSize. Data holds rows × cols/2 bytes; Scales rows × cols/32.
+	Int4Block32 DType = "int4b32"
 )
 
 // BlockSize is the number of consecutive values of a row that share one scale in Int8Block32.
 const BlockSize = 32
+
+// Int4BlockBytes is the size in bytes of one Int4Block32 block.
+const Int4BlockBytes = BlockSize / 2
 
 func dtypeToByte(d DType) byte {
 	switch d {
@@ -55,6 +65,8 @@ func dtypeToByte(d DType) byte {
 		return 4
 	case Int8Block32:
 		return 5
+	case Int4Block32:
+		return 6
 	default:
 		return 255
 	}
@@ -74,6 +86,8 @@ func byteToDType(b byte) (DType, error) {
 		return Float16, nil
 	case 5:
 		return Int8Block32, nil
+	case 6:
+		return Int4Block32, nil
 	default:
 		return "", ErrInvalidDType
 	}
@@ -151,7 +165,7 @@ func (t Tensor) Cols() int {
 func blocksPerRow(cols int) int { return (cols + BlockSize - 1) / BlockSize }
 
 // DequantRow writes row i of the tensor into dst as float32, whatever its storage: Float32 is
-// copied, Int8 uses the row's scale, Int8Block32 uses one scale per BlockSize values.
+// copied, Int8 uses the row's scale, Int8Block32 and Int4Block32 use one scale per BlockSize values.
 func (t Tensor) DequantRow(dst []float32, i int) error {
 	if len(t.Shape) == 0 || i < 0 || i >= t.Shape[0] {
 		return ErrRowOutOfRange
@@ -186,6 +200,15 @@ func (t Tensor) DequantRow(dst []float32, i int) error {
 		for c, b := range row {
 			dst[c] = float32(int8(b)) * scales[c/BlockSize]
 		}
+	case Int4Block32:
+		if cols%BlockSize != 0 {
+			return ErrInt4Cols
+		}
+		nb := cols / BlockSize
+		if len(t.Scales) != t.Shape[0]*nb {
+			return ErrScalesMismatch
+		}
+		DequantInt4Block32(dst[:cols], t.Data[i*cols/2:(i+1)*cols/2], t.Scales[i*nb:(i+1)*nb])
 	default:
 		return ErrInvalidDType
 	}
