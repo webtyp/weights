@@ -3,8 +3,9 @@ PLAN: "feat: Int4Block32 — 4-bit weights in blocks of 32 (GGUF Q4_0 layout), w
 TAG: v0.4.0
 EXECUTOR: jules
 REVIEWER: none
-STATUS: running
+STATUS: review
 SESSION: 9695452286506609361
+PR: https://github.com/webtyp/weights/pull/2
 ---
 
 > This plan is dispatched via the CodeJob workflow. See skill: agents-workflow.
